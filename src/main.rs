@@ -38,6 +38,12 @@ struct Args {
     max_missing: u32,
     #[arg(long, default_value_t = 80.0)]
     max_centroid_distance: f32,
+    #[arg(long, default_value_t = 0.0)]
+    exclude_top_percent: f32,
+    #[arg(long, default_value_t = 1.2)]
+    min_aspect_ratio: f32,
+    #[arg(long, default_value_t = 4.0)]
+    max_aspect_ratio: f32,
     #[arg(long)]
     headless: bool,
     #[arg(long)]
@@ -123,21 +129,28 @@ impl CentroidTracker {
         let mut matched_detections: HashSet<usize> = HashSet::new();
 
         for (dist, track_id, det_idx) in pairs {
-            if dist > self.max_distance {
-                continue;
-            }
             if matched_tracks.contains(&track_id) || matched_detections.contains(&det_idx) {
                 continue;
             }
-            if let Some(track) = self.tracks.get_mut(&track_id) {
-                let rect = detections[det_idx];
-                track.rect = rect;
-                track.centroid = rect_centroid(&rect);
-                track.missing = 0;
+            // Check IoU for overlapping detections (helps with stationary objects)
+            let should_match = if let Some(track) = self.tracks.get(&track_id) {
+                let iou = rect_iou(track.rect, detections[det_idx]);
+                dist <= self.max_distance || iou > 0.3
+            } else {
+                false
+            };
+            
+            if should_match {
+                if let Some(track) = self.tracks.get_mut(&track_id) {
+                    let rect = detections[det_idx];
+                    track.rect = rect;
+                    track.centroid = rect_centroid(&rect);
+                    track.missing = 0;
+                }
+                matched_tracks.insert(track_id);
+                matched_detections.insert(det_idx);
+                stats.matched += 1;
             }
-            matched_tracks.insert(track_id);
-            matched_detections.insert(det_idx);
-            stats.matched += 1;
         }
 
         let track_ids: Vec<usize> = self.tracks.keys().copied().collect();
@@ -421,6 +434,14 @@ fn run(args: Args) -> Result<()> {
         let mut detections: Vec<Rect> = rects_full.to_vec();
         detections.extend(rects_upper.to_vec());
         let detections = nms_rects(&detections, args.nms_iou);
+        let frame_height = frame.rows();
+        let detections = filter_detections(
+            &detections,
+            frame_height,
+            args.exclude_top_percent,
+            args.min_aspect_ratio,
+            args.max_aspect_ratio,
+        );
 
         let stats = tracker.update(&detections);
         let tp_frame = (stats.matched + stats.new_tracks) as u64;
@@ -520,6 +541,35 @@ fn centroid_distance(a: (f32, f32), b: (f32, f32)) -> f32 {
     let dx = a.0 - b.0;
     let dy = a.1 - b.1;
     (dx * dx + dy * dy).sqrt()
+}
+
+fn filter_detections(
+    rects: &[Rect],
+    frame_height: i32,
+    exclude_top_percent: f32,
+    min_aspect_ratio: f32,
+    max_aspect_ratio: f32,
+) -> Vec<Rect> {
+    let exclude_y_threshold = (frame_height as f32 * exclude_top_percent) as i32;
+    
+    rects
+        .iter()
+        .filter(|rect| {
+            // ROI filter: exclude ceiling area
+            if rect.y < exclude_y_threshold {
+                return false;
+            }
+            
+            // Aspect ratio filter: people are taller than wide
+            let aspect_ratio = rect.height as f32 / rect.width.max(1) as f32;
+            if aspect_ratio < min_aspect_ratio || aspect_ratio > max_aspect_ratio {
+                return false;
+            }
+            
+            true
+        })
+        .copied()
+        .collect()
 }
 
 fn rect_area(rect: Rect) -> f32 {
