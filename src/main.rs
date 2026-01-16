@@ -52,12 +52,13 @@ struct Args {
     log_interval_seconds: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Track {
     id: usize,
     rect: Rect,
     centroid: (f32, f32),
     missing: u32,
+    histogram: Mat,
 }
 
 #[derive(Debug, Default)]
@@ -73,15 +74,17 @@ struct CentroidTracker {
     next_id: usize,
     max_missing: u32,
     max_distance: f32,
+    histogram_weight: f32,
 }
 
 impl CentroidTracker {
-    fn new(max_missing: u32, max_distance: f32) -> Self {
+    fn new(max_missing: u32, max_distance: f32, histogram_weight: f32) -> Self {
         Self {
             tracks: HashMap::new(),
             next_id: 1,
             max_missing,
             max_distance,
+            histogram_weight,
         }
     }
 
@@ -93,22 +96,30 @@ impl CentroidTracker {
         let mut tracks: Vec<Track> = self
             .tracks
             .values()
-            .copied()
+            .cloned()
             .filter(|track| track.missing == 0)
             .collect();
         tracks.sort_by_key(|track| track.id);
         tracks
     }
 
-    fn update(&mut self, detections: &[Rect]) -> TrackingStats {
+    fn update(&mut self, frame: &Mat, detections: &[Rect]) -> TrackingStats {
         let mut stats = TrackingStats::default();
         if detections.is_empty() && self.tracks.is_empty() {
             return stats;
         }
 
+        // Pre-compute histograms for all detections
+        let detection_histograms: Vec<Option<Mat>> = detections
+            .iter()
+            .map(|rect| compute_hue_histogram(frame, *rect).ok())
+            .collect();
+
         if self.tracks.is_empty() {
-            for rect in detections {
-                self.add_track(*rect);
+            for (rect, hist_opt) in detections.iter().zip(detection_histograms.iter()) {
+                if let Some(hist) = hist_opt {
+                    self.add_track_with_histogram(*rect, hist.clone());
+                }
             }
             stats.new_tracks = detections.len();
             stats.active_tracks = self.tracks.len();
@@ -132,10 +143,27 @@ impl CentroidTracker {
             if matched_tracks.contains(&track_id) || matched_detections.contains(&det_idx) {
                 continue;
             }
-            // Check IoU for overlapping detections (helps with stationary objects)
+            // Combined matching: spatial distance + appearance similarity
             let should_match = if let Some(track) = self.tracks.get(&track_id) {
                 let iou = rect_iou(track.rect, detections[det_idx]);
-                dist <= self.max_distance || iou > 0.3
+                
+                // IoU match takes priority (stationary objects)
+                if iou > 0.3 {
+                    true
+                } else if dist <= self.max_distance {
+                    // Compute combined score if within distance threshold
+                    let spatial_score = 1.0 - (dist / self.max_distance).min(1.0);
+                    let hist_score = detection_histograms[det_idx]
+                        .as_ref()
+                        .map(|det_hist| compare_histograms(&track.histogram, det_hist))
+                        .unwrap_or(0.0) as f32;
+                    
+                    let combined_score = (1.0 - self.histogram_weight) * spatial_score 
+                                       + self.histogram_weight * hist_score;
+                    combined_score > 0.4
+                } else {
+                    false
+                }
             } else {
                 false
             };
@@ -146,6 +174,11 @@ impl CentroidTracker {
                     track.rect = rect;
                     track.centroid = rect_centroid(&rect);
                     track.missing = 0;
+                    
+                    // Update histogram with exponential moving average
+                    if let Some(new_hist) = &detection_histograms[det_idx] {
+                        blend_histograms(&mut track.histogram, new_hist, 0.2);
+                    }
                 }
                 matched_tracks.insert(track_id);
                 matched_detections.insert(det_idx);
@@ -167,8 +200,10 @@ impl CentroidTracker {
             if matched_detections.contains(&det_idx) {
                 continue;
             }
-            self.add_track(*rect);
-            stats.new_tracks += 1;
+            if let Some(hist) = &detection_histograms[det_idx] {
+                self.add_track_with_histogram(*rect, hist.clone());
+                stats.new_tracks += 1;
+            }
         }
 
         let to_remove: Vec<usize> = self
@@ -191,12 +226,13 @@ impl CentroidTracker {
         stats
     }
 
-    fn add_track(&mut self, rect: Rect) {
+    fn add_track_with_histogram(&mut self, rect: Rect, histogram: Mat) {
         let track = Track {
             id: self.next_id,
             rect,
             centroid: rect_centroid(&rect),
             missing: 0,
+            histogram,
         };
         self.tracks.insert(self.next_id, track);
         self.next_id += 1;
@@ -376,7 +412,7 @@ fn run(args: Args) -> Result<()> {
         }
     }
 
-    let mut tracker = CentroidTracker::new(args.max_missing, args.max_centroid_distance);
+    let mut tracker = CentroidTracker::new(args.max_missing, args.max_centroid_distance, 0.4);
     let mut metrics = MetricsAccumulator::default();
     let mut interval_metrics = MetricsAccumulator::default();
 
@@ -443,7 +479,7 @@ fn run(args: Args) -> Result<()> {
             args.max_aspect_ratio,
         );
 
-        let stats = tracker.update(&detections);
+        let stats = tracker.update(&frame, &detections);
         let tp_frame = (stats.matched + stats.new_tracks) as u64;
         let fn_frame = stats.unmatched_tracks as u64;
 
@@ -541,6 +577,98 @@ fn centroid_distance(a: (f32, f32), b: (f32, f32)) -> f32 {
     let dx = a.0 - b.0;
     let dy = a.1 - b.1;
     (dx * dx + dy * dy).sqrt()
+}
+
+/// Compute a 32-bin hue histogram for the given ROI.
+/// Masks out low-saturation pixels (shadows, highlights).
+fn compute_hue_histogram(frame: &Mat, rect: Rect) -> Result<Mat> {
+    // Clamp rect to frame bounds
+    let x = rect.x.max(0);
+    let y = rect.y.max(0);
+    let w = (rect.width).min(frame.cols() - x);
+    let h = (rect.height).min(frame.rows() - y);
+    
+    if w <= 0 || h <= 0 {
+        bail!("Invalid ROI dimensions");
+    }
+    
+    let roi_rect = Rect::new(x, y, w, h);
+    let roi = Mat::roi(frame, roi_rect)?;
+    
+    // Convert to HSV
+    let mut hsv = Mat::default();
+    imgproc::cvt_color(
+        &roi,
+        &mut hsv,
+        imgproc::COLOR_BGR2HSV,
+        0,
+        core::AlgorithmHint::ALGO_HINT_DEFAULT,
+    )?;
+    
+    // Create mask for reasonable saturation/value (exclude shadows/highlights)
+    let mut mask = Mat::default();
+    let lower = core::Vector::<f64>::from_slice(&[0.0, 50.0, 50.0]);
+    let upper = core::Vector::<f64>::from_slice(&[180.0, 255.0, 255.0]);
+    core::in_range(&hsv, &lower, &upper, &mut mask)?;
+    
+    // Calculate hue histogram (channel 0)
+    let mut hist = Mat::default();
+    let mut images = core::Vector::<Mat>::new();
+    images.push(hsv);
+    let channels = core::Vector::<i32>::from_slice(&[0]);
+    let hist_size = core::Vector::<i32>::from_slice(&[32]);
+    let ranges = core::Vector::<f32>::from_slice(&[0.0, 180.0]);
+    
+    imgproc::calc_hist(
+        &images,
+        &channels,
+        &mask,
+        &mut hist,
+        &hist_size,
+        &ranges,
+        false,
+    )?;
+    
+    // Normalize to 0-255 range
+    let mut hist_normalized = Mat::default();
+    core::normalize(
+        &hist,
+        &mut hist_normalized,
+        0.0,
+        255.0,
+        core::NORM_MINMAX,
+        -1,
+        &core::no_array(),
+    )?;
+    
+    Ok(hist_normalized)
+}
+
+/// Compare two histograms using correlation method.
+/// Returns a value between 0.0 (no match) and 1.0 (perfect match).
+fn compare_histograms(hist1: &Mat, hist2: &Mat) -> f64 {
+    if hist1.empty() || hist2.empty() {
+        return 0.0;
+    }
+    
+    match imgproc::compare_hist(hist1, hist2, imgproc::HISTCMP_CORREL) {
+        Ok(score) => score.max(0.0), // Clamp negative correlations to 0
+        Err(_) => 0.0,
+    }
+}
+
+/// Blend a new histogram into an existing one using exponential moving average.
+/// alpha controls how much weight the new histogram gets (0.0-1.0).
+fn blend_histograms(existing: &mut Mat, new_hist: &Mat, alpha: f64) {
+    if existing.empty() || new_hist.empty() {
+        return;
+    }
+    
+    // existing = (1 - alpha) * existing + alpha * new_hist
+    if let Ok(mut blended) = Mat::default().try_clone() {
+        let _ = core::add_weighted(existing, 1.0 - alpha, new_hist, alpha, 0.0, &mut blended, -1);
+        let _ = blended.copy_to(existing);
+    }
 }
 
 fn filter_detections(
